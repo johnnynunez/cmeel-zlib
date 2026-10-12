@@ -1,0 +1,122 @@
+name: Windows ARM64 probe (fork-only, not for upstream)
+
+on:
+  push:
+    branches:
+      - probe/windows-11-arm
+  workflow_dispatch:
+
+env:
+  CMEEL_LOG_LEVEL: DEBUG
+  PROJECT: cmeel-zlib
+
+jobs:
+  wheel:
+    name: "Build cp314 ${{ matrix.os }} (${{ matrix.variant }})"
+    runs-on: "${{ matrix.os }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # unchanged project settings: cmeel default (Visual Studio generator)
+          - os: windows-11-arm
+            variant: default
+            cibw_env: CMEEL_LOG_LEVEL="DEBUG"
+          # workaround for cmeel#141: default config for `cmake --build`
+          - os: windows-11-arm
+            variant: config-release
+            cibw_env: CMEEL_LOG_LEVEL="DEBUG" CMAKE_CONFIG_TYPE="Release"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+      - run: pipx install cibuildwheel
+      - run: cibuildwheel
+        env:
+          CIBW_BUILD: "cp314-*"
+          CIBW_ARCHS_WINDOWS: "ARM64"
+          CIBW_REPAIR_WHEEL_COMMAND: ""
+          CIBW_ENVIRONMENT_WINDOWS: "${{ matrix.cibw_env }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: "artifact-${{ matrix.os }}-${{ matrix.variant }}"
+          path: wheelhouse
+
+  inspect:
+    needs: ["wheel"]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dl
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install pefile
+      - name: inspect wheels
+        shell: python
+        run: |
+          import glob, zipfile, pefile, csv, io, hashlib, base64
+          for whl in sorted(glob.glob("dl/**/*.whl", recursive=True)):
+              print("=" * 80)
+              print(whl)
+              z = zipfile.ZipFile(whl)
+              names = z.namelist()
+              for n in names:
+                  print("  ", n, z.getinfo(n).file_size)
+              rec = [n for n in names if n.endswith(".dist-info/RECORD")][0]
+              bad = 0
+              for row in csv.reader(io.StringIO(z.read(rec).decode())):
+                  if not row or not row[1]:
+                      continue
+                  algo, digest = row[1].split("=", 1)
+                  h = base64.urlsafe_b64encode(hashlib.new(algo, z.read(row[0])).digest()).rstrip(b"=").decode()
+                  bad += h != digest
+              print("RECORD mismatches:", bad)
+              wheel_meta = [n for n in names if n.endswith(".dist-info/WHEEL")][0]
+              print(z.read(wheel_meta).decode())
+              for n in names:
+                  data = z.read(n)
+                  if data[:2] != b"MZ":
+                      if "/scripts/" in n:
+                          print("  SCRIPT (text)", n, repr(data[:80]))
+                      continue
+                  pe = pefile.PE(data=data)
+                  imps = [e.dll.decode() for e in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])]
+                  dbg = [i for i in imps if i.lower().endswith("d.dll") and i.lower().startswith(("vcruntime", "msvcp", "ucrtbase"))]
+                  print(f"  PE {n}: machine=0x{pe.FILE_HEADER.Machine:04X} imports={imps} debug_crt={dbg}")
+
+  install:
+    needs: ["wheel"]
+    if: always()
+    name: "Install ${{ matrix.variant }}"
+    runs-on: windows-11-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, config-release]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: "artifact-windows-11-arm-${{ matrix.variant }}"
+          path: wheelhouse
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          architecture: arm64
+      - run: python -c "import sysconfig, platform; print(sysconfig.get_platform(), platform.machine())"
+      - run: python -m pip install wheelhouse/*.whl
+      - run: python -m pip show -f cmeel-zlib
+      - name: what landed in Scripts
+        run: |
+          scripts=$(python -c "import sysconfig; print(sysconfig.get_path('scripts'))")
+          ls -la "$scripts" | grep -i zlib || true
+          for f in "$scripts"/zlib*; do echo "== $f"; head -c 200 "$f" | od -c | head -5; done
+      - name: cmeel paths
+        run: |
+          python -m cmeel cmake || true
+          python -m cmeel lib || true
